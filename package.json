@@ -1,0 +1,7 @@
+{
+  "name": "moranguinho-bot",
+  "version": "1.0.0",
+  "main": "moranguinho-bot.js",
+  "scripts": { "start": "node moranguinho-bot.js" },
+  "engines": { "node": ">=18" }
+}
