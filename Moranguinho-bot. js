@@ -1,0 +1,309 @@
+// Robô do Clube da Moranguinho - WhatsApp (Z-API)
+// Sem dependências. Precisa de Node 18 ou mais novo.
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+
+// ===================== CONFIGURAÇÃO (variáveis de ambiente) =====================
+const C = {
+  INSTANCE: process.env.ZAPI_INSTANCE || '',
+  TOKEN: process.env.ZAPI_TOKEN || '',
+  CLIENT_TOKEN: process.env.ZAPI_CLIENT_TOKEN || '',
+  OWNER: (process.env.OWNER_PHONE || '').replace(/\D/g, ''),
+  SECRET: process.env.WEBHOOK_SECRET || '',
+  ADMIN_KEY: process.env.ADMIN_KEY || process.env.WEBHOOK_SECRET || '',
+  PORT: Number(process.env.PORT || 3000),
+  DATA_FILE: process.env.DATA_FILE || path.join(__dirname, 'dados.json'),
+  CARTAO_URL: process.env.CARTAO_URL || '',
+  FRASE: (process.env.FRASE_ENTRADA || 'clube da moranguinho'),
+  ABRE: Number(process.env.HORA_ABRE || 18),
+  FECHA: Number(process.env.HORA_FECHA || 22),
+  TZ: 'America/Sao_Paulo',
+  DEBUG: process.env.DEBUG === '1',
+};
+
+// ===================== TEXTOS (edite aqui) =====================
+const CARDAPIO = `🍓 *CARDÁPIO MORANGUINHO*
+
+🍨 *Cascão*
+• Tradicional (2 bolas): R$ 8
+• Especial (3 bolas): R$ 13
+
+🥤 *Milkshake*
+• Tradicional (Morango, Chocolate, Doce de leite): R$ 11,99
+• Gourmet (Chocolate, Morango, Doce de leite): R$ 14,99
+
+🍧 *Sundae*
+• Comum: R$ 12
+• Especial: R$ 16
+
+🍨 *Taças (R$ 19,99)*
+Ovomaltine, Paçoca, Choco Supreme, Ninho Trufado, Sonho de Chocolate
+
+🍭 *Picolés*
+• Simples: R$ 2
+• Frutas / Cremosinho: R$ 3
+• Mega Max: R$ 5`;
+
+const MSG = {
+  boasVindas: `Olá! 🍓 Seja bem-vindo(a) ao *Clube da Moranguinho*!
+
+Aqui você tem descontos especiais e é o primeiro a saber das nossas promoções.
+
+🎁 *Como funciona:* a cada 10 pedidos, o 11º é por nossa conta! Você ganha o produto que mais consumiu nos 10 pedidos.
+
+Vou fazer seu cadastro rapidinho. *Qual é o seu nome?*`,
+  pedeNascimento: (n) => `Prazer, ${n}! 😊 Qual a sua *data de nascimento*? (dia/mês/ano, ex: 14/03/1995)`,
+  nascimentoInvalido: `Não entendi a data 😅 Envie assim: *14/03/1995* (dia/mês/ano com 4 números no ano).`,
+  pedeSexo: `Você é do sexo *F* (feminino) ou *M* (masculino)? Se preferir não dizer, responda *PULAR*.`,
+  sexoInvalido: `Responda *F*, *M* ou *PULAR*, por favor.`,
+  pedeEndereco: `Por último: qual o seu *endereço* para entrega? (rua, número, bairro e uma referência)`,
+  fora: `Agora estamos fechados 😴 Atendemos das ${C.ABRE}h às ${C.FECHA}h. Seu cadastro no clube está guardado! Volte nesse horário para pedir. 🍓`,
+  pagamento: `Como você vai pagar?
+*1* - Dinheiro
+*2* - Cartão
+*3* - Pix`,
+  pagamentoInvalido: `Responda com *1* (Dinheiro), *2* (Cartão) ou *3* (Pix).`,
+  troco: `Precisa de troco? Para quanto? (ou responda *NÃO*)`,
+};
+
+const ordem = (n) => (n === 1 ? '1 pedido' : `${n} pedidos`);
+
+// ===================== BANCO DE DADOS (arquivo JSON) =====================
+let db = { clientes: {}, pedidos: [], vistos: [] };
+try { db = Object.assign(db, JSON.parse(fs.readFileSync(C.DATA_FILE, 'utf8'))); } catch (e) { /* primeira vez */ }
+function salvar() {
+  const tmp = C.DATA_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(db));
+  fs.renameSync(tmp, C.DATA_FILE);
+}
+
+// ===================== UTILIDADES =====================
+const norm = (s) => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+
+function agora() {
+  const p = new Intl.DateTimeFormat('en-CA', { timeZone: C.TZ, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(new Date());
+  const g = (t) => p.find((x) => x.type === t).value;
+  return { ano: +g('year'), mes: +g('month'), dia: +g('day'), hora: +g('hour'), min: +g('minute') };
+}
+const dataBR = () => { const a = agora(); return `${String(a.dia).padStart(2, '0')}/${String(a.mes).padStart(2, '0')}/${a.ano}`; };
+const horaBR = () => { const a = agora(); return `${String(a.hora).padStart(2, '0')}:${String(a.min).padStart(2, '0')}`; };
+const aberto = () => { const h = agora().hora; return h >= C.ABRE && h < C.FECHA; };
+
+function pagos(phone) { return db.pedidos.filter((p) => p.phone === phone && !p.gratis).length; }
+function gratisDisponiveis(c) { return Math.floor(pagos(c.phone) / 10) - (c.gratisUsados || 0); }
+
+// ===================== ENVIO (Z-API) =====================
+async function zapi(endpoint, body) {
+  const url = `https://api.z-api.io/instances/${C.INSTANCE}/token/${C.TOKEN}/${endpoint}`;
+  const headers = { 'Content-Type': 'application/json' };
+  if (C.CLIENT_TOKEN) headers['Client-Token'] = C.CLIENT_TOKEN;
+  try {
+    const r = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
+    if (!r.ok) console.error('Z-API erro', endpoint, r.status, await r.text());
+    return r.ok;
+  } catch (e) { console.error('Z-API falhou', endpoint, e.message); return false; }
+}
+const enviar = (phone, message) => zapi('send-text', { phone, message, delayTyping: 2 });
+async function enviarCartao(phone, nome) {
+  const legenda = `🎁 Este é o seu *cartão fidelidade*, ${nome}! A cada pedido eu marco um. No 10º pedido, o 11º é por nossa conta!`;
+  if (C.CARTAO_URL) {
+    const ok = await zapi('send-image', { phone, image: C.CARTAO_URL, caption: legenda });
+    if (ok) return;
+  }
+  await enviar(phone, legenda);
+}
+const avisarDono = (texto) => (C.OWNER ? enviar(C.OWNER, texto) : null);
+
+// ===================== LÓGICA DO ROBÔ =====================
+function statusClube(c) {
+  const p = pagos(c.phone);
+  const disp = gratisDisponiveis(c);
+  if (disp > 0) return `🎁 Você tem *${disp} pedido(s) GRÁTIS* esperando! É só pedir. 🍓`;
+  const falta = 10 - (p % 10);
+  return `🍓 Você já fez *${ordem(p)}* no clube. Faltam *${falta}* para o seu pedido grátis!`;
+}
+
+async function finalizarPedido(c) {
+  const pd = c.pendente;
+  const ehGratis = !!pd.gratis;
+  const ultimos = ehGratis ? db.pedidos.filter((p) => p.phone === c.phone && !p.gratis).slice(-10).map((p) => p.itens) : [];
+  const pedido = { id: db.pedidos.length + 1, data: dataBR(), hora: horaBR(), phone: c.phone, nome: c.nome, itens: pd.itens, pagamento: pd.pagamento, troco: pd.troco || '', endereco: pd.endereco, gratis: ehGratis };
+  db.pedidos.push(pedido);
+  if (ehGratis) c.gratisUsados = (c.gratisUsados || 0) + 1;
+  c.etapa = 'ativo';
+  c.pendente = null;
+  salvar();
+
+  let progresso;
+  if (ehGratis) progresso = '🎉 Este foi o seu pedido *GRÁTIS* do clube! Obrigado por fazer parte! 🍓';
+  else if (gratisDisponiveis(c) > 0) progresso = '🎁 Parabéns! Você completou 10 pedidos: o *próximo pedido é GRÁTIS*! 🎉';
+  else {
+    const falta = 10 - (pagos(c.phone) % 10);
+    progresso = falta <= 2 ? `🔥 Falta${falta > 1 ? 'm' : ''} só *${falta}* pedido${falta > 1 ? 's' : ''} para o seu grátis!` : `🍓 Pedidos no clube: *${pagos(c.phone)}*. Faltam *${falta}* para o grátis.`;
+  }
+  await enviar(c.phone, `✅ *Pedido anotado!*\n\n🛒 ${pedido.itens}\n💳 ${pedido.pagamento}${pedido.troco ? ` (troco: ${pedido.troco})` : ''}\n📍 ${pedido.endereco}\n\nJá vamos confirmar o valor e preparar. Obrigado, ${c.nome}! 🍓\n\n${progresso}`);
+
+  await avisarDono(`🔔 *NOVO PEDIDO #${pedido.id}*${ehGratis ? ' 🎁 *(GRÁTIS DO CLUBE)*' : ''}\n\n👤 ${c.nome} (${c.phone})\n🛒 ${pedido.itens}\n💳 ${pedido.pagamento}${pedido.troco ? ` (troco: ${pedido.troco})` : ''}\n📍 ${pedido.endereco}` +
+    (ehGratis ? `\n\n📋 Últimos pedidos dele (veja o produto que mais pediu):\n- ${ultimos.join('\n- ')}` : ''));
+}
+
+async function tratar(phone, texto, nomeWhats) {
+  const t = norm(texto);
+  let c = db.clientes[phone];
+
+  // Só atende quem mandou a frase do QR
+  if (!c) {
+    if (!t.includes(norm(C.FRASE))) return;
+    c = db.clientes[phone] = { phone, nomeWhats: nomeWhats || '', etapa: 'nome', entrada: dataBR(), gratisUsados: 0, ultimoParabens: 0 };
+    salvar();
+    return enviar(phone, MSG.boasVindas);
+  }
+
+  switch (c.etapa) {
+    case 'nome': {
+      const nome = String(texto).trim().slice(0, 60);
+      if (nome.length < 2) return enviar(phone, 'Qual é o seu nome? 😊');
+      c.nome = nome; c.etapa = 'nascimento'; salvar();
+      return enviar(phone, MSG.pedeNascimento(nome));
+    }
+    case 'nascimento': {
+      const m = String(texto).match(/(\d{1,2})\s*[\/\-. ]\s*(\d{1,2})\s*[\/\-. ]\s*(\d{4})/);
+      const d = m && +m[1], mes = m && +m[2], a = m && +m[3];
+      if (!m || d < 1 || d > 31 || mes < 1 || mes > 12 || a < 1900 || a > agora().ano) return enviar(phone, MSG.nascimentoInvalido);
+      c.nascimento = `${String(d).padStart(2, '0')}/${String(mes).padStart(2, '0')}/${a}`; c.etapa = 'sexo'; salvar();
+      return enviar(phone, MSG.pedeSexo);
+    }
+    case 'sexo': {
+      if (t.startsWith('f')) c.sexo = 'F';
+      else if (t.startsWith('m')) c.sexo = 'M';
+      else if (t.startsWith('p')) c.sexo = '';
+      else return enviar(phone, MSG.sexoInvalido);
+      c.etapa = 'endereco'; salvar();
+      return enviar(phone, MSG.pedeEndereco);
+    }
+    case 'endereco': {
+      const end = String(texto).trim();
+      if (end.length < 5) return enviar(phone, 'Pode mandar o endereço completo? (rua, número, bairro) 🙏');
+      c.endereco = end; c.etapa = 'ativo'; salvar();
+      await enviar(phone, `Cadastro concluído, ${c.nome}! 🎉 Você agora é do *Clube da Moranguinho*!`);
+      await enviarCartao(phone, c.nome);
+      await enviar(phone, CARDAPIO);
+      await enviar(phone, aberto() ? 'O que vai ser hoje? 😋 É só me escrever o seu pedido.' : MSG.fora);
+      return avisarDono(`🆕 *Novo cliente no clube*\n👤 ${c.nome}\n📱 ${c.phone}\n🎂 ${c.nascimento}\n📍 ${c.endereco}`);
+    }
+    case 'pedido_pagamento': {
+      let pg = '';
+      if (t === '1' || t.startsWith('dinh')) pg = 'Dinheiro';
+      else if (t === '2' || t.startsWith('cart')) pg = 'Cartão';
+      else if (t === '3' || t.startsWith('pix')) pg = 'Pix';
+      else return enviar(phone, MSG.pagamentoInvalido);
+      c.pendente.pagamento = pg;
+      if (pg === 'Dinheiro') { c.etapa = 'pedido_troco'; salvar(); return enviar(phone, MSG.troco); }
+      c.etapa = 'pedido_endereco'; salvar();
+      return enviar(phone, `Entregamos em:\n📍 ${c.endereco}\n\n*1* - Sim, nesse endereço\n*2* - Outro endereço`);
+    }
+    case 'pedido_troco': {
+      c.pendente.troco = t.startsWith('nao') || t === 'n' ? '' : String(texto).trim().slice(0, 30);
+      c.etapa = 'pedido_endereco'; salvar();
+      return enviar(phone, `Entregamos em:\n📍 ${c.endereco}\n\n*1* - Sim, nesse endereço\n*2* - Outro endereço`);
+    }
+    case 'pedido_endereco': {
+      if (t === '1' || t.startsWith('sim')) { c.pendente.endereco = c.endereco; return finalizarPedido(c); }
+      if (t === '2' || t.startsWith('outro')) { c.etapa = 'pedido_novo_endereco'; salvar(); return enviar(phone, 'Qual o endereço da entrega? (rua, número, bairro)'); }
+      return enviar(phone, 'Responda *1* (nesse endereço) ou *2* (outro endereço).');
+    }
+    case 'pedido_novo_endereco': {
+      c.pendente.endereco = String(texto).trim().slice(0, 200);
+      return finalizarPedido(c);
+    }
+    default: break; // 'ativo'
+  }
+
+  // Cliente já cadastrado e sem pedido em andamento
+  if (/^(cardapio|menu)/.test(t)) return enviar(phone, CARDAPIO);
+  if (/(meus pedidos|cartao|fidelidade|quantos pedidos|quanto falta)/.test(t)) return enviar(phone, statusClube(c));
+  if (t.length < 4 || /^(oi+|ola|opa|bom dia|boa tarde|boa noite|e ai|eai)\b/.test(t)) {
+    return enviar(phone, `Oi, ${c.nome}! 🍓 Digite *cardápio* para ver o menu${aberto() ? ' ou me escreva o que vai querer.' : '.'}`);
+  }
+  if (!aberto()) return enviar(phone, MSG.fora);
+
+  c.pendente = { itens: String(texto).trim().slice(0, 400), gratis: gratisDisponiveis(c) > 0 };
+  c.etapa = 'pedido_pagamento'; salvar();
+  const aviso = c.pendente.gratis ? '🎁 Esse é o seu pedido *GRÁTIS* do clube!\n\n' : '';
+  return enviar(phone, `${aviso}Anotei: *${c.pendente.itens}*\n\n${MSG.pagamento}`);
+}
+
+// Uma fila por cliente, para não misturar mensagens seguidas
+const filas = new Map();
+function empilhar(phone, fn) {
+  const ant = filas.get(phone) || Promise.resolve();
+  const prox = ant.then(fn).catch((e) => console.error('erro no robô', e));
+  filas.set(phone, prox);
+  prox.finally(() => { if (filas.get(phone) === prox) filas.delete(phone); });
+}
+
+// ===================== PARABÉNS DE ANIVERSÁRIO =====================
+async function verificarAniversarios() {
+  const a = agora();
+  if (a.hora !== 9) return; // manda por volta das 9h
+  for (const c of Object.values(db.clientes)) {
+    if (!c.nascimento || c.etapa === 'nome' || c.ultimoParabens === a.ano) continue;
+    const [d, m] = c.nascimento.split('/').map(Number);
+    if (d === a.dia && m === a.mes) {
+      c.ultimoParabens = a.ano; salvar();
+      await enviar(c.phone, `🎉 Parabéns, ${c.nome}! 🎂 Ficamos felizes em ter você mais um ano conosco. Venha comemorar na Moranguinho! 🍓`);
+    }
+  }
+}
+
+// ===================== SERVIDOR WEB =====================
+const csvCel = (v) => `"${String(v == null ? '' : v).replace(/"/g, '""')}"`;
+const csv = (cab, linhas) => '\uFEFF' + [cab, ...linhas].map((l) => l.map(csvCel).join(';')).join('\r\n');
+
+function criarServidor() {
+  return http.createServer((req, res) => {
+    const url = new URL(req.url, 'http://x');
+    const resp = (code, body, tipo = 'text/plain; charset=utf-8') => { res.writeHead(code, { 'Content-Type': tipo }); res.end(body); };
+
+    if (req.method === 'GET' && url.pathname === '/') return resp(200, 'Robô da Moranguinho no ar 🍓');
+
+    if (req.method === 'GET' && (url.pathname === '/clientes.csv' || url.pathname === '/pedidos.csv')) {
+      if (!C.ADMIN_KEY || url.searchParams.get('key') !== C.ADMIN_KEY) return resp(403, 'acesso negado');
+      if (url.pathname === '/clientes.csv') {
+        const lin = Object.values(db.clientes).map((c) => [c.nome, c.phone, c.nascimento, c.sexo, c.endereco, c.entrada, pagos(c.phone), Math.floor(pagos(c.phone) / 10), c.gratisUsados || 0]);
+        return resp(200, csv(['Nome', 'WhatsApp', 'Nascimento', 'Sexo', 'Endereço', 'Entrada', 'Pedidos pagos', 'Grátis ganhos', 'Grátis usados'], lin), 'text/csv; charset=utf-8');
+      }
+      const lin = db.pedidos.map((p) => [p.id, p.data, p.hora, p.nome, p.phone, p.itens, p.pagamento, p.troco, p.endereco, p.gratis ? 'Sim' : 'Não']);
+      return resp(200, csv(['Nº', 'Data', 'Hora', 'Nome', 'WhatsApp', 'Pedido', 'Pagamento', 'Troco', 'Endereço', 'Grátis'], lin), 'text/csv; charset=utf-8');
+    }
+
+    if (req.method === 'POST' && C.SECRET && url.pathname === `/webhook/${C.SECRET}`) {
+      let corpo = '';
+      req.on('data', (d) => { corpo += d; if (corpo.length > 1e6) req.destroy(); });
+      req.on('end', () => {
+        resp(200, 'ok'); // responde rápido para a Z-API
+        try {
+          const b = JSON.parse(corpo);
+          if (C.DEBUG) console.log('webhook:', corpo);
+          const texto = b.text && b.text.message;
+          if (!texto || b.fromMe || b.isGroup || b.isNewsletter) return;
+          const phone = String(b.phone || '').replace(/\D/g, '');
+          if (!phone) return;
+          const id = b.messageId;
+          if (id) { if (db.vistos.includes(id)) return; db.vistos.push(id); if (db.vistos.length > 500) db.vistos.shift(); }
+          empilhar(phone, () => tratar(phone, texto, b.senderName || b.chatName));
+        } catch (e) { console.error('webhook inválido', e.message); }
+      });
+      return;
+    }
+    resp(404, 'não encontrado');
+  });
+}
+
+if (require.main === module) {
+  if (!C.INSTANCE || !C.TOKEN || !C.SECRET) console.error('ATENÇÃO: faltam ZAPI_INSTANCE, ZAPI_TOKEN ou WEBHOOK_SECRET');
+  criarServidor().listen(C.PORT, () => console.log('Robô ligado na porta', C.PORT));
+  setInterval(() => verificarAniversarios().catch(console.error), 30 * 60 * 1000);
+}
+module.exports = { tratar, db, pagos, gratisDisponiveis };
